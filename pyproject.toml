@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aksarallm"
+version = "2.0.0"
+description = "Model Bahasa AI Open-Source Indonesia"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.9"
+authors = [{name = "AksaraLLM Team"}]
+keywords = ["nlp", "indonesian", "llm", "ai", "language-model"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.optional-dependencies]
+runtime = [
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "huggingface_hub>=0.22.0",
+    "accelerate>=0.28.0",
+    "tokenizers>=0.15.0",
+]
+demo = [
+    "gradio>=4.20.0",
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "huggingface_hub>=0.22.0",
+    "accelerate>=0.28.0",
+    "tokenizers>=0.15.0",
+]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+aksarallm-chat = "aksarallm.inference:main"
+aksarallm-webui = "aksarallm.webui:main"
+
+[project.urls]
+Homepage = "https://github.com/AksaraLLM/AksaraLLM"
+Repository = "https://github.com/AksaraLLM/AksaraLLM"
+Documentation = "https://huggingface.co/AksaraLLM"
+
+[tool.setuptools.packages.find]
+where = ["src"]

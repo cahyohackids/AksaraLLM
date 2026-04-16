@@ -1,0 +1,63 @@
+{
+  "name": "aksarallm-20b-dense",
+  "family": "decoder-only-transformer",
+  "estimated_params": 19831191552,
+  "architecture": {
+    "vocab_size": 131072,
+    "n_embd": 6144,
+    "n_inner": 16384,
+    "n_layers": 42,
+    "n_heads": 48,
+    "n_kv_heads": 8,
+    "head_dim": 128,
+    "norm_type": "rmsnorm",
+    "activation": "swiglu",
+    "positional_encoding": "rope",
+    "attention_type": "gqa",
+    "attention_bias": false,
+    "tie_embeddings": true,
+    "rope_theta": 1000000
+  },
+  "sequence_plan": {
+    "train_context_main": 8192,
+    "train_context_late": 32768,
+    "inference_context_target": 131072,
+    "rope_scaling": {
+      "type": "yarn",
+      "factor": 4.0,
+      "original_max_position_embeddings": 32768
+    }
+  },
+  "token_plan": {
+    "minimum_viable_tokens": 400000000000,
+    "recommended_tokens": 600000000000,
+    "strong_tokens": 1000000000000
+  },
+  "data_mix": {
+    "global_high_quality_web_min": 0.35,
+    "global_high_quality_web_max": 0.45,
+    "multilingual_web_min": 0.20,
+    "multilingual_web_max": 0.25,
+    "indonesia_sea_targeted_min": 0.12,
+    "indonesia_sea_targeted_max": 0.18,
+    "code_min": 0.10,
+    "code_max": 0.15,
+    "reference_text_min": 0.10,
+    "reference_text_max": 0.15
+  },
+  "source_priority": [
+    "HuggingFaceFW/fineweb",
+    "HuggingFaceFW/fineweb-2",
+    "uonlp/CulturaX",
+    "SEACrowd/indo4b",
+    "SEACrowd/cc100",
+    "bigcode/the-stack-v2",
+    "allenai/dolma",
+    "togethercomputer/RedPajama-Data-V2"
+  ],
+  "notes": [
+    "Dense-first is the lowest-risk path for the current AksaraLLM codebase.",
+    "Keep the existing unified Aksara datasets for SFT, DPO, SIGAP, and late-stage continued pretraining, not for web-scale base pretraining.",
+    "Tokenizer should move from 32K to at least 128K for multilingual 20B scale."
+  ]
+}
