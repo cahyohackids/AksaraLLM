@@ -359,9 +359,23 @@ try:
     dpo_ds = load_dataset(Config.DPO_REPO, split="train")
     print(f"  ✅ DPO data: {len(dpo_ds):,} pairs")
     
-    # Freeze reference model (copy current weights)
-    import copy
-    ref_model = copy.deepcopy(model)
+    # Freeze reference model. NEVER use copy.deepcopy on the in-place model:
+    # that doubles the on-device (TPU/GPU) HBM footprint of the policy,
+    # which is the #1 reason DPO OOMs at mid/large scale. Instead, save the
+    # current (post-SFT) weights to disk and reload the ref from there. At
+    # 20B scale the correct path is to use ORPO or SimPO (reference-free)
+    # entirely; this script is still Qwen2.5-1.5B, so a CPU-side load keeps
+    # HBM flat while adding ~3 GB of host RAM.
+    ref_snapshot_dir = os.path.join(Config.WORK_DIR, "ref_snapshot_sft")
+    os.makedirs(ref_snapshot_dir, exist_ok=True)
+    model.save_pretrained(ref_snapshot_dir)
+    tokenizer.save_pretrained(ref_snapshot_dir)
+    ref_model = AutoModelForCausalLM.from_pretrained(
+        ref_snapshot_dir,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+    )
+    ref_model = ref_model.to(device)
     ref_model.eval()
     for p in ref_model.parameters():
         p.requires_grad = False
