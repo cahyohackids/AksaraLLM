@@ -113,27 +113,40 @@ class SourceSpec:
 
 
 SOURCES: Sequence[SourceSpec] = (
+    # --- global high-quality web ---
     SourceSpec("fineweb", "HuggingFaceFW/fineweb", "sample-10BT", "train", "text",
                bucket="global_high_quality_web", language="en"),
+    # --- multilingual web ---
     SourceSpec("fineweb2_id", "HuggingFaceFW/fineweb-2", "ind_Latn", "train", "text",
                bucket="multilingual_web", language="id"),
     SourceSpec("culturax_id", "uonlp/CulturaX", "id", "train", "text",
                bucket="multilingual_web", language="id"),
     SourceSpec("culturax_ms", "uonlp/CulturaX", "ms", "train", "text",
                bucket="multilingual_web", language="ms"),
-    SourceSpec("indo4b", "SEACrowd/indo4b", None, "train", "text",
-               bucket="indonesia_sea_targeted", language="id"),
-    SourceSpec("cc100_jv", "SEACrowd/cc100", "jav_Latn", "train", "text",
+    # --- Indonesia / SEA targeted ---
+    # NOTE: SEACrowd/indo4b, SEACrowd/cc100 use datasets v2-style loading scripts
+    # which are deprecated in ``datasets`` ≥4. FineWeb-2 + CulturaX provide good
+    # coverage for JV/SU directly. Wikipedia JV supplements reference text.
+    SourceSpec("fineweb2_jv", "HuggingFaceFW/fineweb-2", "jav_Latn", "train", "text",
                bucket="indonesia_sea_targeted", language="jv", lid_threshold=0.4),
-    SourceSpec("cc100_su", "SEACrowd/cc100", "sun_Latn", "train", "text",
+    SourceSpec("fineweb2_su", "HuggingFaceFW/fineweb-2", "sun_Latn", "train", "text",
                bucket="indonesia_sea_targeted", language="su", lid_threshold=0.4),
-    SourceSpec("thestack2_py", "bigcode/the-stack-v2", "Python", "train", "content",
+    SourceSpec("culturax_jv", "uonlp/CulturaX", "jv", "train", "text",
+               bucket="indonesia_sea_targeted", language="jv", lid_threshold=0.4),
+    SourceSpec("culturax_su", "uonlp/CulturaX", "su", "train", "text",
+               bucket="indonesia_sea_targeted", language="su", lid_threshold=0.4),
+    # --- code ---
+    # NOTE: bigcode/the-stack-v2 is gated and requires explicit Hub acceptance.
+    # Once access is granted, add back:
+    #   SourceSpec("thestack2_py", "bigcode/the-stack-v2", "Python", ...)
+    SourceSpec("code_search_net", "code_search_net", "all", "train", "whole_func_string",
                bucket="code", language="", min_words=5),
-    SourceSpec("thestack2_js", "bigcode/the-stack-v2", "JavaScript", "train", "content",
-               bucket="code", language="", min_words=5),
-    SourceSpec("dolma_books", "allenai/dolma", "books", "train", "text",
-               bucket="reference_text", language="en"),
-    SourceSpec("dolma_wiki", "allenai/dolma", "wiki", "train", "text",
+    # --- reference text (Wikipedia; allenai/dolma is script-based, excluded) ---
+    SourceSpec("wikipedia_id", "wikimedia/wikipedia", "20231101.id", "train", "text",
+               bucket="reference_text", language="id"),
+    SourceSpec("wikipedia_jv", "wikimedia/wikipedia", "20231101.jv", "train", "text",
+               bucket="reference_text", language="jv", lid_threshold=0.4),
+    SourceSpec("wikipedia_en", "wikimedia/wikipedia", "20231101.en", "train", "text",
                bucket="reference_text", language="en"),
 )
 
@@ -226,7 +239,12 @@ def _ensure_lid_model(assets_dir: Path) -> Path:
 
 
 class FastTextLID:
-    """Thin wrapper over the fastText LID model."""
+    """Thin wrapper over the fastText LID model.
+
+    Calls the underlying C++ predict via ``self._model.f.predict`` to
+    bypass fasttext's Python wrapper, which uses ``np.array(..., copy=False)``
+    and breaks on NumPy ≥ 2.0 (``ValueError: Unable to avoid copy``).
+    """
 
     def __init__(self, model_path: Path):
         import fasttext  # local import so --help works without the dep
@@ -236,11 +254,21 @@ class FastTextLID:
     def predict(self, text: str) -> Tuple[str, float]:
         # fastText does not like newlines in predict().
         probe = text[:2000].replace("\n", " ")
-        labels, probs = self._model.predict(probe, k=1)
-        if not labels:
+        try:
+            predictions = self._model.f.predict(probe, 1, 0.0, "strict")
+        except Exception:
             return "und", 0.0
-        lang = labels[0].removeprefix("__label__")
-        return lang, float(probs[0])
+        if not predictions:
+            return "und", 0.0
+        # fasttext's low-level ``f.predict`` returns ``[(prob, label), ...]``.
+        first = predictions[0]
+        if isinstance(first[0], (int, float)):
+            prob, label = first
+        else:
+            label, prob = first
+        if isinstance(label, bytes):
+            label = label.decode("utf-8", errors="ignore")
+        return str(label).removeprefix("__label__"), float(prob)
 
 
 # ---------------------------------------------------------------------------
@@ -566,10 +594,36 @@ def cmd_build(args: argparse.Namespace) -> None:
 
     per_source_stats: List[Dict[str, object]] = []
     seen_hashes: set[str] = set()
+
+    # Optional --sources filter.
+    source_filter = None
+    if getattr(args, "sources", None):
+        source_filter = {s.strip() for s in args.sources.split(",") if s.strip()}
+
+    def _write_manifest() -> None:
+        manifest = {
+            "target_total_tokens": args.target_total_tokens,
+            "bucket_targets": bucket_targets,
+            "per_source_budget": per_source_budget,
+            "per_source_stats": per_source_stats,
+        }
+        (output_dir / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
     for spec in SOURCES:
+        if source_filter and spec.name not in source_filter:
+            LOG.info("skipping %s (not in --sources filter)", spec.name)
+            continue
         budget = per_source_budget.get(spec.name, 0)
         if budget <= 0:
             continue
+        # Reset per-source MinHash to bound memory. Near-dup coverage is
+        # within-source (our bigger concern); cross-source exact dedup is
+        # already handled by ``seen_hashes``.
+        minhash = MinHashDedup(
+            num_perm=args.minhash_perm, threshold=args.minhash_threshold
+        )
         try:
             stats = process_source(
                 spec,
@@ -586,16 +640,8 @@ def cmd_build(args: argparse.Namespace) -> None:
             LOG.exception("source %s failed: %s", spec.name, exc)
             stats = {"source": spec.name, "error": str(exc)}
         per_source_stats.append(stats)
+        _write_manifest()  # flush after each source for resume visibility
 
-    manifest = {
-        "target_total_tokens": args.target_total_tokens,
-        "bucket_targets": bucket_targets,
-        "per_source_budget": per_source_budget,
-        "per_source_stats": per_source_stats,
-    }
-    (output_dir / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
     print(f"wrote manifest: {output_dir / 'manifest.json'}")
 
 
@@ -619,6 +665,15 @@ def _build_parser() -> argparse.ArgumentParser:
     build.add_argument("--decontam", action="store_true", default=True)
     build.add_argument("--no-decontam", dest="decontam", action="store_false")
     build.add_argument("--decontam-ngram", type=int, default=13)
+    build.add_argument(
+        "--sources",
+        default=None,
+        help=(
+            "Comma-separated list of source names to build (e.g. "
+            "'fineweb,fineweb2_id,indo4b'). If omitted, all sources from SOURCES "
+            "are built. Useful for skipping gated datasets or running in parallel."
+        ),
+    )
     build.set_defaults(func=cmd_build)
     return parser
 
