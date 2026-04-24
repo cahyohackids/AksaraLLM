@@ -152,8 +152,15 @@ class PretrainConfig:
 
 
 def _build_easydel_config(cfg: PretrainConfig, model_cfg: Dict[str, Any]):
-    """Translate AksaraLLM JSON config into an EasyDeL LLaMA config."""
-    from easydel.modules.llama.llama_configuration import LlamaConfig  # type: ignore
+    """Translate AksaraLLM JSON config into an EasyDeL LLaMA config.
+
+    Uses the top-level ``easydel.LlamaConfig`` symbol, which works for
+    EasyDeL ≥ 0.1.4 (the Flax NNX lineage).  For older EasyDeL (0.0.x,
+    Linen) the same symbol is available at
+    ``easydel.modules.llama.llama_configuration.LlamaConfig`` — update this
+    import if you have to pin to an older EasyDeL.
+    """
+    from easydel import LlamaConfig  # type: ignore
 
     arch = model_cfg["architecture"]
     seq_plan = model_cfg.get("sequence_plan", {})
@@ -287,8 +294,8 @@ def train(cfg: PretrainConfig) -> None:
 
     # Imports kept local so --help works on machines without the TPU stack.
     import easydel as ed  # type: ignore
+    import flax.nnx as nnx  # type: ignore
     import orbax.checkpoint as ocp  # type: ignore
-    from flax.training import train_state  # type: ignore
     from transformers import AutoTokenizer  # type: ignore
 
     wandb = None
@@ -322,19 +329,18 @@ def train(cfg: PretrainConfig) -> None:
     tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer)
 
     with mesh:
-        model = ed.FlaxLlamaForCausalLM(
+        # EasyDeL ≥ 0.1.4 uses Flax NNX: the model owns its parameters
+        # directly as attributes and requires ``rngs``. Construction must
+        # happen inside the mesh context so sharding constraints resolve.
+        model = ed.LlamaForCausalLM(
             easy_cfg,
+            rngs=nnx.Rngs(cfg.seed),
             dtype=getattr(jnp, cfg.compute_dtype),
             param_dtype=getattr(jnp, cfg.param_dtype),
             precision=None,
-            _do_init=True,
         )
         tx, lr_schedule = _build_optimizer(cfg, cfg.max_steps)
-        state = train_state.TrainState.create(
-            apply_fn=model.__call__,
-            params=model.params,
-            tx=tx,
-        )
+        optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
     ckpt_mgr = ocp.CheckpointManager(
         directory=cfg.output_dir,
@@ -351,14 +357,15 @@ def train(cfg: PretrainConfig) -> None:
         if latest is not None:
             if jax.process_index() == 0:
                 print(f"[pretrain] resuming from step {latest}", flush=True)
+            # NNX: save/restore the full optimizer (wraps model + opt state).
+            state = nnx.state(optimizer)
             restored = ckpt_mgr.restore(latest, args=ocp.args.StandardRestore(state))
-            state = restored
+            nnx.update(optimizer, restored)
             start_step = latest
 
-    def loss_fn(params, batch):
-        logits = state.apply_fn(batch[:, :-1], params=params, train=True).logits
+    def loss_fn(model, batch):
+        logits = model(batch[:, :-1]).logits
         labels = batch[:, 1:]
-        vocab = logits.shape[-1]
         loss = -jnp.take_along_axis(
             jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1),
             labels[..., None],
@@ -366,16 +373,14 @@ def train(cfg: PretrainConfig) -> None:
         ).squeeze(-1).mean()
         return loss
 
-    grad_fn = jax.value_and_grad(loss_fn)
-
-    @jax.jit
-    def train_step(state, batch):
-        loss, grads = grad_fn(state.params, batch)
-        state = state.apply_gradients(grads=grads)
+    @nnx.jit
+    def train_step(model, optimizer, batch):
+        loss, grads = nnx.value_and_grad(loss_fn)(model, batch)
+        optimizer.update(grads)
         grad_norm = jnp.sqrt(
             sum(jnp.vdot(g, g).real for g in jax.tree_util.tree_leaves(grads))
         )
-        return state, loss, grad_norm
+        return loss, grad_norm
 
     batch_iter = _batch_iterator(cfg, tokenizer, micro_batch=micro_batch)
 
@@ -384,7 +389,7 @@ def train(cfg: PretrainConfig) -> None:
     for step in range(start_step, cfg.max_steps):
         batch = next(batch_iter)
         t0 = time.time()
-        state, loss, grad_norm = train_step(state, jnp.asarray(batch))
+        loss, grad_norm = train_step(model, optimizer, jnp.asarray(batch))
         loss.block_until_ready()
         dt = time.time() - t0
         step_time_ema = 0.98 * step_time_ema + 0.02 * dt if step_time_ema else dt
@@ -410,14 +415,14 @@ def train(cfg: PretrainConfig) -> None:
                 )
 
         if step > 0 and step % cfg.ckpt_every == 0:
-            ckpt_mgr.save(step, args=ocp.args.StandardSave(state))
+            ckpt_mgr.save(step, args=ocp.args.StandardSave(nnx.state(optimizer)))
 
         if cfg.smoke_test and step >= 20:
             if jax.process_index() == 0:
                 print("[pretrain] smoke test complete — exiting at step 20", flush=True)
             break
 
-    ckpt_mgr.save(cfg.max_steps, args=ocp.args.StandardSave(state))
+    ckpt_mgr.save(cfg.max_steps, args=ocp.args.StandardSave(nnx.state(optimizer)))
     ckpt_mgr.wait_until_finished()
 
 

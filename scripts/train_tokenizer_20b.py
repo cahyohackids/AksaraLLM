@@ -133,14 +133,24 @@ def iter_corpus(corpus: Path, max_bytes: int | None = None) -> Iterator[str]:
     if corpus.is_file():
         paths = [corpus]
     elif corpus.is_dir():
-        flat = [p for p in corpus.iterdir() if p.is_file()]
-        if flat:
-            paths = flat
-        else:
-            paths = [p for p in corpus.rglob("*") if p.is_file()]
+        # Always walk recursively and keep only recognised shard extensions.
+        # ``manifest.json`` and other bookkeeping files must not be fed to
+        # the BPE trainer (it silently trains on them and you end up with a
+        # 586-slot vocab). Matching suffixes here is the load-bearing fix.
+        allowed = {".txt", ".text", ".jsonl"}
+        paths = [
+            p for p in corpus.rglob("*")
+            if p.is_file() and p.suffix.lower() in allowed
+        ]
         random.shuffle(paths)
     else:
         raise FileNotFoundError(f"corpus path not found: {corpus}")
+
+    if not paths:
+        raise FileNotFoundError(
+            f"no .txt/.text/.jsonl files found under {corpus}. "
+            "Populate the corpus directory first."
+        )
 
     seen_bytes = 0
     for path in paths:
