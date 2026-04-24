@@ -57,8 +57,11 @@ LOG = logging.getLogger("dedup")
 
 
 def _estimate_tokens(text: str) -> int:
-    # Same 4-chars-per-token approximation used by the producer.
-    return max(1, len(text) // 4)
+    # Match the producer's estimate in build_pretrain_corpus_v2.py:
+    # 0.75 * whitespace word count. Keeping these formulas in sync
+    # ensures ``dedup_manifest.json`` token counts are comparable to
+    # the per-producer manifests for downstream data-mix accounting.
+    return max(1, int(0.75 * len(text.split())))
 
 
 class MinHashLSHIndex:
