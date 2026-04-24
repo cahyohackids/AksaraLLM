@@ -116,6 +116,15 @@ SOURCES: Sequence[SourceSpec] = (
     # --- global high-quality web ---
     SourceSpec("fineweb", "HuggingFaceFW/fineweb", "sample-10BT", "train", "text",
                bucket="global_high_quality_web", language="en"),
+    # Larger FineWeb samples for parallel producers (same source family,
+    # partitioned via --skip so docs don't overlap).
+    SourceSpec("fineweb_100bt", "HuggingFaceFW/fineweb", "sample-100BT", "train", "text",
+               bucket="global_high_quality_web", language="en"),
+    SourceSpec("fineweb_350bt", "HuggingFaceFW/fineweb", "sample-350BT", "train", "text",
+               bucket="global_high_quality_web", language="en"),
+    # FineWeb-Edu (filtered for educational content; higher quality signal).
+    SourceSpec("fineweb_edu", "HuggingFaceFW/fineweb-edu", "sample-10BT", "train", "text",
+               bucket="global_high_quality_web", language="en"),
     # --- multilingual web ---
     SourceSpec("fineweb2_id", "HuggingFaceFW/fineweb-2", "ind_Latn", "train", "text",
                bucket="multilingual_web", language="id"),
@@ -363,13 +372,24 @@ def doc_is_contaminated(text: str, bad: set[str], n: int = 13) -> bool:
 
 
 class ShardWriter:
-    """Writes Parquet shards under ``output_dir/source/shard-XXXXX.parquet``."""
+    """Writes Parquet shards under ``output_dir/source/{prefix}shard-XXXXX.parquet``.
 
-    def __init__(self, output_dir: Path, source: str, shard_target_bytes: int):
+    ``shard_prefix`` lets parallel producers writing to the same ``output_dir``
+    avoid filename collisions (e.g. ``p2-shard-00000.parquet``).
+    """
+
+    def __init__(
+        self,
+        output_dir: Path,
+        source: str,
+        shard_target_bytes: int,
+        shard_prefix: str = "",
+    ):
         self._dir = output_dir / source
         self._dir.mkdir(parents=True, exist_ok=True)
         self._source = source
         self._target_bytes = shard_target_bytes
+        self._prefix = shard_prefix
         self._buf: List[Dict[str, str]] = []
         self._buf_bytes = 0
         self._shard = 0
@@ -388,7 +408,8 @@ class ShardWriter:
         import pyarrow.parquet as pq
 
         table = pa.Table.from_pylist(self._buf)
-        path = self._dir / f"shard-{self._shard:05d}.parquet"
+        name = f"{self._prefix}shard-{self._shard:05d}.parquet"
+        path = self._dir / name
         pq.write_table(table, path, compression="zstd")
         self._docs_written += len(self._buf)
         LOG.info(
@@ -462,6 +483,8 @@ def process_source(
     max_docs: Optional[int],
     shard_target_bytes: int,
     seen_hashes: set[str],
+    shard_prefix: str = "",
+    skip_docs: int = 0,
 ) -> Dict[str, object]:
     """Stream one source and write clean Parquet shards. Returns stats."""
     from datasets import load_dataset  # noqa: local import
@@ -473,8 +496,11 @@ def process_source(
         split=spec.split,
         streaming=True,
     )
+    if skip_docs > 0:
+        LOG.info("  %s: skipping first %d docs", spec.name, skip_docs)
+        ds = ds.skip(skip_docs)
 
-    writer = ShardWriter(output_dir, spec.name, shard_target_bytes)
+    writer = ShardWriter(output_dir, spec.name, shard_target_bytes, shard_prefix=shard_prefix)
 
     stats = {
         "source": spec.name,
@@ -600,14 +626,19 @@ def cmd_build(args: argparse.Namespace) -> None:
     if getattr(args, "sources", None):
         source_filter = {s.strip() for s in args.sources.split(",") if s.strip()}
 
+    manifest_name = "manifest.json"
+    if args.shard_prefix:
+        manifest_name = f"manifest-{args.shard_prefix.rstrip('-')}.json"
+
     def _write_manifest() -> None:
         manifest = {
             "target_total_tokens": args.target_total_tokens,
             "bucket_targets": bucket_targets,
             "per_source_budget": per_source_budget,
             "per_source_stats": per_source_stats,
+            "shard_prefix": args.shard_prefix or "",
         }
-        (output_dir / "manifest.json").write_text(
+        (output_dir / manifest_name).write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
@@ -635,6 +666,8 @@ def cmd_build(args: argparse.Namespace) -> None:
                 max_docs=args.max_docs_per_source,
                 shard_target_bytes=args.shard_target_bytes,
                 seen_hashes=seen_hashes,
+                shard_prefix=args.shard_prefix or "",
+                skip_docs=args.skip_docs or 0,
             )
         except Exception as exc:
             LOG.exception("source %s failed: %s", spec.name, exc)
@@ -672,6 +705,27 @@ def _build_parser() -> argparse.ArgumentParser:
             "Comma-separated list of source names to build (e.g. "
             "'fineweb,fineweb2_id,indo4b'). If omitted, all sources from SOURCES "
             "are built. Useful for skipping gated datasets or running in parallel."
+        ),
+    )
+    build.add_argument(
+        "--shard-prefix",
+        default="",
+        help=(
+            "Prefix prepended to every emitted shard filename, e.g. 'p2-' yields "
+            "'p2-shard-00000.parquet'. Use this when running multiple producers "
+            "concurrently against the same --output-dir to avoid shard filename "
+            "collisions."
+        ),
+    )
+    build.add_argument(
+        "--skip-docs",
+        type=int,
+        default=0,
+        help=(
+            "Skip the first N documents of each processed source's streaming "
+            "iterator. Use this to partition a large dataset (e.g. "
+            "HuggingFaceFW/fineweb sample-350BT) across multiple producers so "
+            "they do not reprocess the same documents."
         ),
     )
     build.set_defaults(func=cmd_build)
