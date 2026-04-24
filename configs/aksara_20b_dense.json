@@ -1,11 +1,18 @@
 {
   "name": "aksarallm-20b-dense",
   "family": "decoder-only-transformer",
-  "estimated_params": 19831191552,
+  "estimated_params": 20359673856,
+  "estimated_params_breakdown": {
+    "comment": "Computed for tied embeddings: per-layer attn (no bias, GQA 48:8) = 88,080,384; per-layer SwiGLU FFN (3 * d * n_inner) = 377,487,360; per-layer norms (2 * d) = 12,288; per-layer total = 465,580,032. 42 layers = 19,554,361,344. Tied embedding (V * d) = 805,306,368. Final RMSNorm = 6,144. Grand total = 20,359,673,856 (~20.36 B).",
+    "per_layer": 465580032,
+    "all_layers": 19554361344,
+    "embedding_tied": 805306368,
+    "final_norm": 6144
+  },
   "architecture": {
     "vocab_size": 131072,
     "n_embd": 6144,
-    "n_inner": 16384,
+    "n_inner": 20480,
     "n_layers": 42,
     "n_heads": 48,
     "n_kv_heads": 8,

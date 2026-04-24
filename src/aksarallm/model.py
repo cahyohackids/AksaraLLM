@@ -39,11 +39,18 @@ class RMSNorm(nn.Module):
 
 class RoPE(nn.Module):
     """Rotary Position Embedding.
-    
+
     Encodes position information directly into attention queries and keys
     via rotation, enabling better length generalization than absolute embeddings.
+
+    Both ``max_len`` and ``theta`` are required: the 20B plan uses
+    ``theta=1_000_000`` with ``max_len`` up to 32K, while the 1.5B smoke test
+    uses ``theta=1_000_000`` with 32K, and the 200M/500M/7B smoke configs use
+    ``theta=10_000`` with 2–8K. Forgetting to pass these caused a latent bug
+    where the 20B config silently ran with ``theta=10_000`` in any path that
+    instantiated ``RoPE`` directly.
     """
-    def __init__(self, dim: int, max_len: int = 4096, theta: float = 10000.0):
+    def __init__(self, dim: int, max_len: int, theta: float):
         super().__init__()
         freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
         angles = torch.outer(torch.arange(max_len).float(), freqs)

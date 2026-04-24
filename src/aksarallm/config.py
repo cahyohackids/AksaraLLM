@@ -1,9 +1,19 @@
-"""Model configuration helpers for AksaraLLM variants."""
+"""Model configuration helpers for AksaraLLM variants.
+
+The 20B config is the **single source of truth** in
+``configs/aksara_20b_dense.json`` and is loaded lazily below. Smaller
+configs are kept inline because they are smoke-test-only.
+"""
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_AKSARA_20B_JSON = _REPO_ROOT / "configs" / "aksara_20b_dense.json"
 
 
 @dataclass(frozen=True)
@@ -19,6 +29,32 @@ class ModelConfig:
     max_seq_len: int
     norm_eps: float = 1e-6
     rope_theta: float = 10000.0
+
+
+def _load_20b_from_json() -> Dict[str, Any]:
+    """Return the 20B config as a CONFIGS-compatible dict."""
+    if not _AKSARA_20B_JSON.is_file():
+        raise FileNotFoundError(
+            f"Expected 20B config at {_AKSARA_20B_JSON}. "
+            "The JSON is the source of truth for the 20B run."
+        )
+    with _AKSARA_20B_JSON.open("r", encoding="utf-8") as f:
+        raw = json.load(f)
+    arch = raw["architecture"]
+    seq = raw.get("sequence_plan", {})
+    return {
+        "vocab_size": arch["vocab_size"],
+        "n_embd": arch["n_embd"],
+        "n_inner": arch["n_inner"],
+        "n_layers": arch["n_layers"],
+        "n_heads": arch["n_heads"],
+        "n_kv_heads": arch["n_kv_heads"],
+        # The main training context; late-stage extension to 32768 is handled
+        # by a separate stage that reloads the checkpoint with a larger
+        # ``max_seq_len`` and re-computes RoPE buffers.
+        "max_seq_len": seq.get("train_context_main", 8192),
+        "rope_theta": float(arch.get("rope_theta", 1_000_000.0)),
+    }
 
 
 CONFIGS: Dict[str, Dict[str, Any]] = {
@@ -62,16 +98,9 @@ CONFIGS: Dict[str, Dict[str, Any]] = {
         "n_kv_heads": 8,
         "max_seq_len": 8192,
     },
-    "aksarallm-20b": {
-        "vocab_size": 131072,
-        "n_embd": 6144,
-        "n_inner": 16384,
-        "n_layers": 42,
-        "n_heads": 48,
-        "n_kv_heads": 8,
-        "max_seq_len": 8192,
-        "rope_theta": 1000000.0,
-    },
+    # aksarallm-20b is loaded from configs/aksara_20b_dense.json at import time
+    # to keep the JSON as the single source of truth.
+    "aksarallm-20b": _load_20b_from_json(),
 }
 
 

@@ -14,7 +14,7 @@ Recommended v1 architecture:
 
 - `vocab_size`: `131072`
 - `n_embd`: `6144`
-- `n_inner`: `16384`
+- `n_inner`: `20480`
 - `n_layers`: `42`
 - `n_heads`: `48`
 - `n_kv_heads`: `8`
@@ -24,7 +24,20 @@ Recommended v1 architecture:
 - `position`: `RoPE`
 - `attention`: `GQA`
 - `tie_embeddings`: `true`
-- `estimated_params`: `19.83B`
+- `estimated_params`: `20.36B`
+
+Parameter count math (verify before any launch):
+
+- Per-layer attention (Q+K+V+O, no bias, GQA 48:8): `88,080,384`
+- Per-layer SwiGLU FFN (`3 * d * n_inner`): `377,487,360`
+- Per-layer RMSNorms (`2 * d`): `12,288`
+- Per-layer total: `465,580,032`
+- 42 layers: `19,554,361,344`
+- Tied embedding (`V * d`): `805,306,368`
+- Final RMSNorm: `6,144`
+- **Grand total: `20,359,673,856` (~20.36 B)**
+
+The earlier `n_inner=16384` gave 17.19 B (off from the "20B" target by ~2.6 B). `n_inner=20480` is the smallest TPU-friendly multiple of 256 that reaches ≥20 B with the other dimensions fixed.
 
 This is intentionally close to the design language used by Qwen2/Qwen2.5 and Mistral-class open models, while staying simple enough for the current AksaraLLM codebase.
 
