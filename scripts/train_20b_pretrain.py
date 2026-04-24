@@ -200,14 +200,41 @@ def _build_mesh(cfg: PretrainConfig):
     return Mesh(devices, axis_names=("data", "model")), dp, tp
 
 
+def _save_checkpoint(ckpt_mgr, step: int, state) -> None:
+    """Best-effort checkpoint save that works across Orbax ≥0.10 API tweaks.
+
+    Orbax changed StandardSave wrapping twice between 0.5 and 0.11 — older
+    managers accept ``args=StandardSave(state)`` directly, newer ones require
+    wrapping in ``Composite(state=StandardSave(state))``. Try them in order.
+    """
+    import orbax.checkpoint as ocp  # type: ignore
+
+    last_exc: Exception | None = None
+    for try_fn in (
+        lambda: ckpt_mgr.save(step, args=ocp.args.Composite(state=ocp.args.StandardSave(state))),
+        lambda: ckpt_mgr.save(step, args=ocp.args.StandardSave(state)),
+        lambda: ckpt_mgr.save(step, state),
+    ):
+        try:
+            try_fn()
+            return
+        except Exception as exc:  # pragma: no cover
+            last_exc = exc
+    print(f"[pretrain] WARN: checkpoint save at step {step} failed: {last_exc}", flush=True)
+
+
 def _build_optimizer(cfg: PretrainConfig, num_steps: int):
     import optax  # type: ignore
 
+    # ``decay_steps`` in optax is the TOTAL step budget (warmup + decay),
+    # not the tail after warmup. Keep it strictly greater than warmup so the
+    # internal cosine window is positive — this avoids a ``decay_steps=0``
+    # crash on tiny smoke configs.
     lr_schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=cfg.peak_lr,
         warmup_steps=cfg.warmup_steps,
-        decay_steps=max(num_steps - cfg.warmup_steps, 1),
+        decay_steps=max(num_steps, cfg.warmup_steps + 1),
         end_value=cfg.peak_lr * cfg.min_lr_ratio,
     )
     if cfg.optimizer == "adamw":
@@ -348,7 +375,7 @@ def train(cfg: PretrainConfig) -> None:
             max_to_keep=cfg.ckpt_keep,
             keep_period=cfg.ckpt_permanent_every,
             create=True,
-            async_checkpointing=True,
+            enable_async_checkpointing=True,
         ),
     )
     start_step = 0
@@ -386,44 +413,48 @@ def train(cfg: PretrainConfig) -> None:
 
     step_time_ema = 0.0
     t_last_log = time.time()
-    for step in range(start_step, cfg.max_steps):
-        batch = next(batch_iter)
-        t0 = time.time()
-        loss, grad_norm = train_step(model, optimizer, jnp.asarray(batch))
-        loss.block_until_ready()
-        dt = time.time() - t0
-        step_time_ema = 0.98 * step_time_ema + 0.02 * dt if step_time_ema else dt
+    # EasyDeL's logical-sharding helpers require the mesh to still be active
+    # inside the training loop, not just during model construction.
+    with mesh:
+        for step in range(start_step, cfg.max_steps):
+            batch = next(batch_iter)
+            t0 = time.time()
+            loss, grad_norm = train_step(model, optimizer, jnp.asarray(batch))
+            loss.block_until_ready()
+            dt = time.time() - t0
+            step_time_ema = 0.98 * step_time_ema + 0.02 * dt if step_time_ema else dt
 
-        if step % 10 == 0 and jax.process_index() == 0:
-            tokens_per_sec = tokens_per_step / max(step_time_ema, 1e-6)
-            lr = float(lr_schedule(step))
-            print(
-                f"step={step:07d} loss={float(loss):.4f} grad_norm={float(grad_norm):.3f} "
-                f"lr={lr:.2e} tok/s={tokens_per_sec:.0f} step_ms={step_time_ema*1000:.1f}",
-                flush=True,
-            )
-            if wandb is not None:
-                wandb.log(
-                    {
-                        "loss": float(loss),
-                        "grad_norm": float(grad_norm),
-                        "learning_rate": lr,
-                        "tokens_per_sec": tokens_per_sec,
-                        "step_ms": step_time_ema * 1000,
-                    },
-                    step=step,
+            if step % 10 == 0 and jax.process_index() == 0:
+                tokens_per_sec = tokens_per_step / max(step_time_ema, 1e-6)
+                lr = float(lr_schedule(step))
+                print(
+                    f"step={step:07d} loss={float(loss):.4f} grad_norm={float(grad_norm):.3f} "
+                    f"lr={lr:.2e} tok/s={tokens_per_sec:.0f} step_ms={step_time_ema*1000:.1f}",
+                    flush=True,
                 )
+                if wandb is not None:
+                    wandb.log(
+                        {
+                            "loss": float(loss),
+                            "grad_norm": float(grad_norm),
+                            "learning_rate": lr,
+                            "tokens_per_sec": tokens_per_sec,
+                            "step_ms": step_time_ema * 1000,
+                        },
+                        step=step,
+                    )
 
-        if step > 0 and step % cfg.ckpt_every == 0:
-            ckpt_mgr.save(step, args=ocp.args.StandardSave(nnx.state(optimizer)))
+            if step > 0 and step % cfg.ckpt_every == 0 and not cfg.smoke_test:
+                _save_checkpoint(ckpt_mgr, step, nnx.state(optimizer))
 
-        if cfg.smoke_test and step >= 20:
-            if jax.process_index() == 0:
-                print("[pretrain] smoke test complete — exiting at step 20", flush=True)
-            break
+            if cfg.smoke_test and step >= 20:
+                if jax.process_index() == 0:
+                    print("[pretrain] smoke test complete — exiting at step 20", flush=True)
+                break
 
-    ckpt_mgr.save(cfg.max_steps, args=ocp.args.StandardSave(nnx.state(optimizer)))
-    ckpt_mgr.wait_until_finished()
+        if not cfg.smoke_test:
+            _save_checkpoint(ckpt_mgr, cfg.max_steps, nnx.state(optimizer))
+            ckpt_mgr.wait_until_finished()
 
 
 # ---------------------------------------------------------------------------
