@@ -675,7 +675,7 @@ def cmd_build(args: argparse.Namespace) -> None:
         per_source_stats.append(stats)
         _write_manifest()  # flush after each source for resume visibility
 
-    print(f"wrote manifest: {output_dir / 'manifest.json'}")
+    print(f"wrote manifest: {output_dir / manifest_name}")
 
 
 def _build_parser() -> argparse.ArgumentParser:
