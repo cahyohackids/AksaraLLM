@@ -157,6 +157,30 @@ SOURCES: Sequence[SourceSpec] = (
                bucket="reference_text", language="jv", lid_threshold=0.4),
     SourceSpec("wikipedia_en", "wikimedia/wikipedia", "20231101.en", "train", "text",
                bucket="reference_text", language="en"),
+    # --- additional large-scale web (added when fineweb partitions saturate) ---
+    # FineWeb-Edu larger samples (same family, partitionable via --skip-docs).
+    SourceSpec("fineweb_edu_100bt", "HuggingFaceFW/fineweb-edu", "sample-100BT", "train", "text",
+               bucket="global_high_quality_web", language="en"),
+    SourceSpec("fineweb_edu_350bt", "HuggingFaceFW/fineweb-edu", "sample-350BT", "train", "text",
+               bucket="global_high_quality_web", language="en"),
+    # mC4 (allenai/c4) — multilingual web crawl; useful for additional id/en/ms
+    # coverage with different filtering than CulturaX/FineWeb-2. Parquet-native,
+    # works fine with `datasets>=4` streaming (no script).
+    SourceSpec("c4_en", "allenai/c4", "en", "train", "text",
+               bucket="global_high_quality_web", language="en"),
+    SourceSpec("c4_id", "allenai/c4", "id", "train", "text",
+               bucket="multilingual_web", language="id"),
+    SourceSpec("c4_ms", "allenai/c4", "ms", "train", "text",
+               bucket="multilingual_web", language="ms"),
+    # Cosmopedia v0.1 web samples — synthetic high-quality educational content.
+    # Adds variety to the high-quality web bucket.
+    SourceSpec("cosmopedia_web", "HuggingFaceTB/cosmopedia", "web_samples_v1", "train", "text",
+               bucket="global_high_quality_web", language="en"),
+    # NOTE: RedPajama-V2, allenai/dolma, mc4, OSCAR-2301, MADLAD-400 were tested
+    # but rejected:
+    #   * RedPajama-V2 / dolma / mc4: script-based (datasets v4 unsupported).
+    #   * OSCAR-2301: gated (requires per-account terms acceptance on HF Hub).
+    #   * MADLAD-400 default: streaming triggers ArrowInvalid on canary shards.
 )
 
 
