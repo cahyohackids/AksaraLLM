@@ -170,6 +170,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Skip MinHash-LSH (much faster; use to debug or when you only want SHA-exact dedup).",
     )
+    p.add_argument(
+        "--shard-range",
+        type=str,
+        default=None,
+        help=(
+            "Process only a slice of the sorted shard list, e.g. '0:80' (zero-based, Python slice). "
+            "Use for parallel MinHash passes: split work across N workers by giving each a "
+            "disjoint range. NOTE: near-duplicates that span ranges are not detected."
+        ),
+    )
     args = p.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -182,6 +192,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     LOG.info("found %d parquet shards under %s", len(paths), args.input_prefix)
     if not paths:
         return 1
+
+    if args.shard_range:
+        try:
+            start_s, end_s = args.shard_range.split(":")
+            start = int(start_s) if start_s else 0
+            end = int(end_s) if end_s else len(paths)
+        except ValueError:
+            LOG.error("--shard-range must be 'START:END' (got %r)", args.shard_range)
+            return 2
+        paths = paths[start:end]
+        LOG.info("shard-range %s:%s -> processing %d shards", start, end, len(paths))
 
     seen: set[str] = set()
     lsh: Optional[MinHashLSHIndex] = None
