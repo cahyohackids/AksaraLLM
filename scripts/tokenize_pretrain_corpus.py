@@ -55,7 +55,12 @@ def _stream_docs(fs, path: str) -> Iterator[dict]:
 
 
 def _resolve_special(tok, name: str) -> Optional[int]:
-    """Best-effort lookup for BOS/EOS across tokenizers with varying token names."""
+    """Best-effort lookup for BOS/EOS across tokenizers with varying token names.
+
+    Slow (non-fast) tokenizers map unknown strings to ``unk_token_id`` rather than
+    raising or returning ``None``, so we explicitly reject that ID when scanning
+    candidates — otherwise we'd silently use UNK as the document separator.
+    """
     cands = []
     if name == "bos":
         cands = ["<|bos|>", "<s>", "<|begin_of_text|>", "<|startoftext|>", "[BOS]"]
@@ -65,10 +70,11 @@ def _resolve_special(tok, name: str) -> Optional[int]:
         cands = ["<|eos|>", "</s>", "<|end_of_text|>", "<|endoftext|>", "[EOS]"]
         if tok.eos_token_id is not None:
             return int(tok.eos_token_id)
+    unk_id = getattr(tok, "unk_token_id", None)
     for c in cands:
         try:
             tid = tok.convert_tokens_to_ids(c)
-            if tid is not None and tid >= 0:
+            if tid is not None and tid >= 0 and tid != unk_id:
                 return int(tid)
         except Exception:
             pass
