@@ -43,7 +43,7 @@ def _list_parquet(fs, prefix: str) -> List[str]:
     return sorted(paths)
 
 
-def _stream_docs(fs, path: str) -> Iterator[dict]:
+def _stream_docs(fs, path: str) -> Iterator[str]:
     import pyarrow.parquet as pq
     with fs.open(path, "rb") as f:
         pf = pq.ParquetFile(f)
@@ -146,8 +146,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     LOG.info("vocab_size=%d bos=%s eos=%s", tok.vocab_size, bos_id, eos_id)
 
     dtype = np.uint16 if args.dtype == "uint16" else np.uint32
-    if dtype is np.uint16 and (tok.vocab_size > 65535):
-        LOG.error("tokenizer vocab %d exceeds uint16; pass --dtype uint32", tok.vocab_size)
+    # ``len(tok)`` includes added/special tokens which sit above ``vocab_size``;
+    # uint16 max ID is 65535 so the limit is ``len(tok) > 65536``.
+    total_vocab = len(tok)
+    if dtype is np.uint16 and total_vocab > 65536:
+        LOG.error("tokenizer vocab %d (incl. added tokens) exceeds uint16; pass --dtype uint32",
+                  total_vocab)
         return 4
 
     seq_len = args.seq_len
