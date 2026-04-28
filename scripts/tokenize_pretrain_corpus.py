@@ -152,6 +152,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     seq_len = args.seq_len
     seqs_per_shard = args.seqs_per_shard
+    # If we prepend BOS after every flush, each pack iteration consumes
+    # ``seq_len - 1`` net tokens from the buffer, so seq_len must be >= 2 to
+    # make forward progress. Without BOS the floor is 1 (still useless but
+    # not a hang).
+    min_seq_len = 2 if bos_id is not None else 1
+    if seq_len < min_seq_len:
+        LOG.error("seq_len=%d too small (need >=%d when bos_id=%s)", seq_len, min_seq_len, bos_id)
+        return 5
     buf: list[int] = []
     if bos_id is not None:
         buf.append(bos_id)
