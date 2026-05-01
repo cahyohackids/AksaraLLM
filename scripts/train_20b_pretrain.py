@@ -98,8 +98,13 @@ class PretrainConfig:
 
     config_json: str
     tokenizer: str
-    corpus_glob: str
+    corpus_glob: Optional[str]
     output_dir: str
+    # Optional GCS glob to pre-tokenized .npy shards (shape [N_seqs, seq_len],
+    # uint32) produced by ``scripts/tokenize_pretrain_corpus.py``. When set the
+    # trainer streams ``int32`` batches directly from .npy without invoking
+    # the HF tokenizer — eliminates the per-step CPU bottleneck.
+    pretok_glob: Optional[str] = None
 
     # Data/seq
     seq_len: int = 8192
@@ -128,6 +133,10 @@ class PretrainConfig:
     # Precision
     param_dtype: str = "float32"
     compute_dtype: str = "bfloat16"
+
+    # Memory
+    gradient_checkpointing: str = "NOTHING_SAVEABLE"  # NONE | CHECKPOINT_DOTS | NOTHING_SAVEABLE | EVERYTHING_SAVEABLE
+    scan_layers: bool = True
 
     # Checkpointing
     ckpt_every: int = 500
@@ -160,10 +169,19 @@ def _build_easydel_config(cfg: PretrainConfig, model_cfg: Dict[str, Any]):
     ``easydel.modules.llama.llama_configuration.LlamaConfig`` — update this
     import if you have to pin to an older EasyDeL.
     """
-    from easydel import LlamaConfig  # type: ignore
+    from easydel import EasyDeLGradientCheckPointers, LlamaConfig  # type: ignore
 
     arch = model_cfg["architecture"]
     seq_plan = model_cfg.get("sequence_plan", {})
+
+    # Gradient checkpointing is MANDATORY for 20B on v5p-64 HBM budget and
+    # also strongly recommended even for the 1B smoke path on v6e-8: without
+    # it the per-layer bf16 [seq, d] activations sum to ~1.2GB per chip at
+    # seq=8192 and OOM the training step. ``NOTHING_SAVEABLE`` is the most
+    # aggressive policy (recomputes every intermediate) — trades ~30% step
+    # time for ~3\u00d7 lower activation memory.
+    gc_mode = cfg.gradient_checkpointing.upper()
+    gc_policy = getattr(EasyDeLGradientCheckPointers, gc_mode)
 
     return LlamaConfig(
         vocab_size=arch["vocab_size"],
@@ -180,6 +198,8 @@ def _build_easydel_config(cfg: PretrainConfig, model_cfg: Dict[str, Any]):
         hidden_act="silu",  # SwiGLU is (W_gate(x) * silu(W_up(x))) · W_down
         initializer_range=0.02,
         use_cache=False,
+        gradient_checkpointing=gc_policy,
+        scan_layers=cfg.scan_layers,
     )
 
 
@@ -266,6 +286,36 @@ def _build_optimizer(cfg: PretrainConfig, num_steps: int):
 # ---------------------------------------------------------------------------
 
 
+def _iter_pretokenized_sequences(cfg: PretrainConfig):
+    """Stream pre-tokenized ``.npy`` shards from GCS and yield seq_len rows.
+
+    Each shard is an ``[N_seqs, seq_len]`` uint32 array written by
+    ``scripts/tokenize_pretrain_corpus.py``. Shards are listed in sorted
+    order; rows within a shard are yielded sequentially. Loops forever so
+    downstream can pull exactly ``max_steps`` batches.
+    """
+    import io
+    import gcsfs  # type: ignore
+
+    assert cfg.pretok_glob is not None
+    fs = gcsfs.GCSFileSystem()
+    paths = sorted(fs.glob(cfg.pretok_glob))
+    if not paths:
+        raise RuntimeError(f"no .npy shards matched {cfg.pretok_glob!r}")
+    if jax.process_index() == 0:
+        print(f"[pretrain] pretokenized shards: {len(paths)} matched {cfg.pretok_glob}", flush=True)
+    while True:
+        for path in paths:
+            with fs.open(path, "rb") as fh:
+                arr = np.load(io.BytesIO(fh.read()))
+            if arr.shape[1] != cfg.seq_len:
+                raise RuntimeError(
+                    f"shard {path} has seq_len={arr.shape[1]} but --seq-len={cfg.seq_len}"
+                )
+            for i in range(arr.shape[0]):
+                yield arr[i]
+
+
 def _iter_packed_sequences(cfg: PretrainConfig, tokenizer):
     """Stream Parquet shards, tokenize, pack to `cfg.seq_len` + BOS/EOS per doc.
 
@@ -299,7 +349,10 @@ def _iter_packed_sequences(cfg: PretrainConfig, tokenizer):
 
 
 def _batch_iterator(cfg: PretrainConfig, tokenizer, micro_batch: int):
-    it = _iter_packed_sequences(cfg, tokenizer)
+    if cfg.pretok_glob:
+        it = _iter_pretokenized_sequences(cfg)
+    else:
+        it = _iter_packed_sequences(cfg, tokenizer)
     while True:
         batch = []
         for _ in range(micro_batch):
@@ -466,7 +519,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--config", required=True, dest="config_json")
     p.add_argument("--tokenizer", required=True)
-    p.add_argument("--corpus-glob", required=True)
+    p.add_argument("--corpus-glob", default=None,
+                   help="GCS glob to raw parquet shards. Used with --tokenizer for on-the-fly tokenization. Mutually exclusive with --pretok-glob.")
+    p.add_argument("--pretok-glob", default=None,
+                   help="GCS glob to pre-tokenized .npy shards (output of scripts/tokenize_pretrain_corpus.py). Recommended: pre-tokenize once, then point trainer here to skip per-step HF tokenizer.")
     p.add_argument("--output-dir", required=True)
     p.add_argument("--seq-len", type=int, default=8192)
     p.add_argument("--global-batch-tokens", type=int, default=2_097_152)
@@ -476,6 +532,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--peak-lr", type=float, default=1.5e-4)
     p.add_argument("--warmup-steps", type=int, default=5_000)
     p.add_argument("--max-steps", type=int, default=200_000)
+    p.add_argument("--param-dtype", default="float32", choices=["float32", "bfloat16"],
+                   help="Parameter storage dtype. bfloat16 halves HBM but gives up fp32 master weights.")
+    p.add_argument("--compute-dtype", default="bfloat16", choices=["float32", "bfloat16"])
+    p.add_argument("--gradient-checkpointing", default="NOTHING_SAVEABLE",
+                   choices=["NONE", "CHECKPOINT_DOTS", "CHECKPOINT_DOTS_WITH_NO_BATCH_DMIS", "NOTHING_SAVEABLE", "EVERYTHING_SAVEABLE"],
+                   help="EasyDeL gradient checkpointing policy. NOTHING_SAVEABLE recomputes every activation (most memory savings).")
+    p.add_argument("--no-scan-layers", action="store_true",
+                   help="Disable ``scan_layers`` (scanning layers keeps the compiled HLO small, highly recommended for large models).")
     p.add_argument("--ckpt-every", type=int, default=500)
     p.add_argument("--ckpt-keep", type=int, default=3)
     p.add_argument("--ckpt-permanent-every", type=int, default=10_000)
@@ -491,10 +555,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if not args.corpus_glob and not args.pretok_glob:
+        raise SystemExit("Exactly one of --corpus-glob or --pretok-glob must be set.")
+    if args.corpus_glob and args.pretok_glob:
+        raise SystemExit("--corpus-glob and --pretok-glob are mutually exclusive.")
     cfg = PretrainConfig(
         config_json=args.config_json,
         tokenizer=args.tokenizer,
         corpus_glob=args.corpus_glob,
+        pretok_glob=args.pretok_glob,
         output_dir=args.output_dir,
         seq_len=args.seq_len,
         global_batch_tokens=args.global_batch_tokens,
@@ -513,6 +582,10 @@ def main(argv: list[str] | None = None) -> int:
         wandb_run_name=args.wandb_run_name,
         seed=args.seed,
         smoke_test=args.smoke_test,
+        param_dtype=args.param_dtype,
+        compute_dtype=args.compute_dtype,
+        gradient_checkpointing=args.gradient_checkpointing,
+        scan_layers=not args.no_scan_layers,
     )
     train(cfg)
     return 0

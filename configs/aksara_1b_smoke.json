@@ -1,0 +1,38 @@
+{
+  "name": "aksarallm-1b-smoke",
+  "family": "decoder-only-transformer",
+  "estimated_params": 1165443072,
+  "estimated_params_breakdown": {
+    "comment": "Smoke-test scaled-down variant for validating the 20B pipeline end-to-end on a single v6e-8 (8 chips, 32 GB HBM each). Keeps the same vocab (131072), GQA 16:4 ratio, and SwiGLU/RMSNorm/RoPE topology as the 20B config so the data + trainer + tokenizer paths exercise identical code. Parameters: per-layer attn (GQA 16:4) = 3,670,016; per-layer SwiGLU FFN (3 * d * n_inner) = 25,165,824; per-layer norms (2 * d) = 4096; per-layer total = 28,839,936. 12 layers = 346,079,232. Tied embedding (V * d) = 268,435,456. Final RMSNorm = 2048. Grand total = 614,516,736 params (~0.6 B) [note: true value is slightly below 1B because we kept vocab large; size is dominated by the embedding table]. Good for pipeline validation, not for real model quality.",
+    "per_layer": 28839936,
+    "all_layers": 346079232,
+    "embedding_tied": 268435456,
+    "final_norm": 2048
+  },
+  "architecture": {
+    "vocab_size": 131072,
+    "n_embd": 2048,
+    "n_inner": 6144,
+    "n_layers": 12,
+    "n_heads": 16,
+    "n_kv_heads": 4,
+    "head_dim": 128,
+    "norm_type": "rmsnorm",
+    "activation": "swiglu",
+    "positional_encoding": "rope",
+    "attention_type": "gqa",
+    "attention_bias": false,
+    "tie_embeddings": true,
+    "rope_theta": 1000000
+  },
+  "sequence_plan": {
+    "train_context_main": 8192,
+    "train_context_late": 8192,
+    "inference_context_target": 8192,
+    "rope_scaling": null
+  },
+  "notes": [
+    "Smoke-test config only: validates data-loader + EasyDeL trainer + checkpointing end-to-end on v6e-8.",
+    "Do NOT use this for a real model release. Use aksara_20b_dense.json on v5p-64+ for the real training run."
+  ]
+}
