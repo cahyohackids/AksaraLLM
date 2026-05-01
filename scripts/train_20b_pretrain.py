@@ -536,7 +536,7 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Parameter storage dtype. bfloat16 halves HBM but gives up fp32 master weights.")
     p.add_argument("--compute-dtype", default="bfloat16", choices=["float32", "bfloat16"])
     p.add_argument("--gradient-checkpointing", default="NOTHING_SAVEABLE",
-                   choices=["NONE", "CHECKPOINT_DOTS", "CHECKPOINT_DOTS_WITH_NO_BATCH_DMIS", "NOTHING_SAVEABLE", "EVERYTHING_SAVEABLE"],
+                   choices=["NONE", "CHECKPOINT_DOTS", "CHECKPOINT_DOTS_WITH_NO_BATCH_DIMS", "NOTHING_SAVEABLE", "EVERYTHING_SAVEABLE"],
                    help="EasyDeL gradient checkpointing policy. NOTHING_SAVEABLE recomputes every activation (most memory savings).")
     p.add_argument("--no-scan-layers", action="store_true",
                    help="Disable ``scan_layers`` (scanning layers keeps the compiled HLO small, highly recommended for large models).")
