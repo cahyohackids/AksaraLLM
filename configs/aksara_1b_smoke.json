@@ -1,11 +1,11 @@
 {
   "name": "aksarallm-1b-smoke",
   "family": "decoder-only-transformer",
-  "estimated_params": 1165443072,
+  "estimated_params": 847300608,
   "estimated_params_breakdown": {
-    "comment": "Smoke-test scaled-down variant for validating the 20B pipeline end-to-end on a single v6e-8 (8 chips, 32 GB HBM each). Keeps the same vocab (131072), GQA 16:4 ratio, and SwiGLU/RMSNorm/RoPE topology as the 20B config so the data + trainer + tokenizer paths exercise identical code. Parameters: per-layer attn (GQA 16:4) = 3,670,016; per-layer SwiGLU FFN (3 * d * n_inner) = 25,165,824; per-layer norms (2 * d) = 4096; per-layer total = 28,839,936. 12 layers = 346,079,232. Tied embedding (V * d) = 268,435,456. Final RMSNorm = 2048. Grand total = 614,516,736 params (~0.6 B) [note: true value is slightly below 1B because we kept vocab large; size is dominated by the embedding table]. Good for pipeline validation, not for real model quality.",
-    "per_layer": 28839936,
-    "all_layers": 346079232,
+    "comment": "Smoke-test scaled-down variant for validating the 20B pipeline end-to-end on a single v6e-8 (8 chips, 32 GB HBM each). Keeps the same vocab (131072), GQA 16:4 ratio, and SwiGLU/RMSNorm/RoPE topology as the 20B config so the data + trainer + tokenizer paths exercise identical code. Parameters: per-layer attn (GQA 16:4, Q+O = 2*d*n_heads*head_dim = 8,388,608; K+V = 2*d*n_kv*head_dim = 2,097,152) = 10,485,760; per-layer SwiGLU FFN (3 * d * n_inner) = 37,748,736; per-layer norms (2 * d) = 4096; per-layer total = 48,238,592. 12 layers = 578,863,104. Tied embedding (V * d) = 268,435,456. Final RMSNorm = 2048. Grand total = 847,300,608 (~0.85 B). Good for pipeline validation, not for real model quality.",
+    "per_layer": 48238592,
+    "all_layers": 578863104,
     "embedding_tied": 268435456,
     "final_norm": 2048
   },
