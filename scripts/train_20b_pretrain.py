@@ -370,14 +370,21 @@ def _iter_packed_sequences(cfg: PretrainConfig, tokenizer):
             yield seq
 
 
-def _batch_iterator(cfg: PretrainConfig, tokenizer, micro_batch: int):
+def _batch_iterator(cfg: PretrainConfig, tokenizer, global_batch_seqs: int):
+    """Yield numpy batches of shape ``(global_batch_seqs, seq_len)`` int32.
+
+    The trainer's caller is responsible for explicitly sharding this array
+    across the ``(dp, fsdp)`` mesh axes via ``jax.device_put`` with a
+    ``NamedSharding(mesh, P(('dp', 'fsdp'), None))``. With that sharding
+    each chip sees ``global_batch_seqs / (dp * fsdp)`` sequences.
+    """
     if cfg.pretok_glob:
         it = _iter_pretokenized_sequences(cfg)
     else:
         it = _iter_packed_sequences(cfg, tokenizer)
     while True:
         batch = []
-        for _ in range(micro_batch):
+        for _ in range(global_batch_seqs):
             batch.append(next(it))
         yield np.asarray(batch, dtype=np.int32)
 
@@ -433,9 +440,19 @@ def train(cfg: PretrainConfig) -> None:
     # across fsdp shards because FSDP all-gathers params per step).
     eff_dp = dp * fsdp
 
-    # Global batch = eff_dp * micro_batch * seq_len. Solve for micro_batch.
-    tokens_per_step = cfg.global_batch_tokens
-    micro_batch = max(1, tokens_per_step // (eff_dp * cfg.seq_len))
+    # Global batch is built as a single ``[B, seq_len]`` array and explicitly
+    # sharded across the ``(dp, fsdp)`` mesh axes. Each chip ends up with
+    # ``micro_batch`` sequences. We REQUIRE ``B`` to be a multiple of
+    # ``eff_dp`` so the sharding splits evenly.
+    micro_batch = max(1, cfg.global_batch_tokens // (eff_dp * cfg.seq_len))
+    global_batch_seqs = micro_batch * eff_dp
+    tokens_per_step = global_batch_seqs * cfg.seq_len
+    if jax.process_index() == 0:
+        print(
+            f"[pretrain] tokens_per_step={tokens_per_step:,} "
+            f"(global_batch_seqs={global_batch_seqs}, micro_batch_per_chip={micro_batch})",
+            flush=True,
+        )
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer)
 
@@ -527,7 +544,17 @@ def train(cfg: PretrainConfig) -> None:
         )
         return loss, grad_norm
 
-    batch_iter = _batch_iterator(cfg, tokenizer, micro_batch=micro_batch)
+    batch_iter = _batch_iterator(cfg, tokenizer, global_batch_seqs=global_batch_seqs)
+
+    # Explicit FSDP+DP batch sharding: every step the host puts the
+    # ``[global_batch_seqs, seq_len]`` array on devices with axis-0
+    # split across the (dp, fsdp) mesh axes. Each chip then physically
+    # sees only ``micro_batch`` sequences, which is the proper SPMD
+    # data-parallel pattern for FSDP. Without this, every chip would
+    # process the same replicated batch and ``tokens_per_step`` would
+    # be ``fsdp``× smaller than configured.
+    from jax.sharding import NamedSharding, PartitionSpec as P  # type: ignore
+    batch_sharding = NamedSharding(mesh, P(("dp", "fsdp"), None))
 
     step_time_ema = 0.0
     t_last_log = time.time()
@@ -537,7 +564,8 @@ def train(cfg: PretrainConfig) -> None:
         for step in range(start_step, cfg.max_steps):
             batch = next(batch_iter)
             t0 = time.time()
-            loss, grad_norm = train_step(model, optimizer, jnp.asarray(batch))
+            batch_jax = jax.device_put(jnp.asarray(batch), batch_sharding)
+            loss, grad_norm = train_step(model, optimizer, batch_jax)
             loss.block_until_ready()
             dt = time.time() - t0
             step_time_ema = 0.98 * step_time_ema + 0.02 * dt if step_time_ema else dt
