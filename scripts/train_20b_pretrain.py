@@ -126,9 +126,15 @@ class PretrainConfig:
     eval_every: int = 5_000
     eval_shards: Optional[str] = None
 
-    # Sharding
-    tp_size: int = 4
-    dp_size: Optional[int] = None  # inferred from total chips if None
+    # Sharding (4D mesh ``(dp, fsdp, tp, sp)`` matching EasyDeL defaults).
+    # For 7B on v6e-8 the most memory-efficient choice is FSDP across all 8
+    # chips: parameters and optimiser state are sharded along that axis,
+    # which is exactly what ``shard_model`` expects when EasyDeL's default
+    # ``axis_dims=(1, -1, 1, 1)`` partition rules are applied.
+    fsdp_size: int = -1  # -1 = consume all chips not used by dp/tp/sp
+    tp_size: int = 1
+    sp_size: int = 1
+    dp_size: int = 1
 
     # Precision
     param_dtype: str = "float32"
@@ -204,20 +210,36 @@ def _build_easydel_config(cfg: PretrainConfig, model_cfg: Dict[str, Any]):
 
 
 def _build_mesh(cfg: PretrainConfig):
+    """Build a 4D ``(dp, fsdp, tp, sp)`` mesh matching EasyDeL defaults.
+
+    EasyDeL's built-in partition rules are written against this exact axis
+    naming/ordering — using a different naming makes ``shard_model`` raise
+    ``Resource axis: fsdp ... is not found in mesh``.
+    """
     from jax.sharding import Mesh
     from jax.experimental import mesh_utils  # type: ignore
 
     total = jax.device_count()
-    tp = cfg.tp_size
-    if total % tp != 0:
+    dp = max(1, cfg.dp_size)
+    tp = max(1, cfg.tp_size)
+    sp = max(1, cfg.sp_size)
+
+    fsdp = cfg.fsdp_size
+    if fsdp <= 0:
+        if total % (dp * tp * sp) != 0:
+            raise ValueError(
+                f"Total chips ({total}) not divisible by dp*tp*sp ({dp}*{tp}*{sp})."
+            )
+        fsdp = total // (dp * tp * sp)
+
+    if dp * fsdp * tp * sp != total:
         raise ValueError(
-            f"Total chips ({total}) not divisible by tp_size ({tp}). "
-            "Override --tp-size or pick a different TPU topology."
+            f"dp*fsdp*tp*sp ({dp}*{fsdp}*{tp}*{sp}) must equal total chips ({total})."
         )
-    dp = cfg.dp_size or (total // tp)
-    assert dp * tp == total, f"dp*tp ({dp}*{tp}) must equal total chips ({total})"
-    devices = mesh_utils.create_device_mesh((dp, tp))
-    return Mesh(devices, axis_names=("data", "model")), dp, tp
+
+    devices = mesh_utils.create_device_mesh((dp, fsdp, tp, sp))
+    mesh = Mesh(devices, axis_names=("dp", "fsdp", "tp", "sp"))
+    return mesh, dp, fsdp, tp, sp
 
 
 def _save_checkpoint(ckpt_mgr, step: int, state) -> None:
@@ -394,31 +416,74 @@ def train(cfg: PretrainConfig) -> None:
 
     model_cfg = cfg.load_model_config()
     easy_cfg = _build_easydel_config(cfg, model_cfg)
-    mesh, dp, tp = _build_mesh(cfg)
+    mesh, dp, fsdp, tp, sp = _build_mesh(cfg)
     if jax.process_index() == 0:
         print(
-            f"[pretrain] mesh = (data={dp}, model={tp}); "
+            f"[pretrain] mesh = (dp={dp}, fsdp={fsdp}, tp={tp}, sp={sp}); "
             f"total chips = {jax.device_count()}",
             flush=True,
         )
 
-    # Global batch = dp * micro_batch * seq_len. Solve for micro_batch.
+    # EasyDeL's default partition rules read ``axis_dims`` / ``axis_names`` off
+    # the model config when ``shard_model`` is invoked. Set them to match the
+    # mesh we just built so the rules resolve correctly.
+    easy_cfg.axis_dims = (dp, fsdp, tp, sp)
+    easy_cfg.axis_names = ("dp", "fsdp", "tp", "sp")
+    # Effective DP for batching = product of dp + fsdp axes (data is replicated
+    # across fsdp shards because FSDP all-gathers params per step).
+    eff_dp = dp * fsdp
+
+    # Global batch = eff_dp * micro_batch * seq_len. Solve for micro_batch.
     tokens_per_step = cfg.global_batch_tokens
-    micro_batch = max(1, tokens_per_step // (dp * cfg.seq_len))
+    micro_batch = max(1, tokens_per_step // (eff_dp * cfg.seq_len))
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer)
 
     with mesh:
-        # EasyDeL ≥ 0.1.4 uses Flax NNX: the model owns its parameters
-        # directly as attributes and requires ``rngs``. Construction must
-        # happen inside the mesh context so sharding constraints resolve.
-        model = ed.LlamaForCausalLM(
-            easy_cfg,
-            rngs=nnx.Rngs(cfg.seed),
-            dtype=getattr(jnp, cfg.compute_dtype),
-            param_dtype=getattr(jnp, cfg.param_dtype),
-            precision=None,
-        )
+        # EasyDeL ≥ 0.1.4 uses Flax NNX. Direct construction
+        # (`ed.LlamaForCausalLM(...)`) materialises every parameter on the
+        # current host before sharding constraints are applied. For models
+        # large enough that a single weight tensor exceeds *per-chip* HBM
+        # (e.g. 20B), this OOMs even though host RAM is ample.
+        #
+        # We try ``lazy_init`` first (no allocation, then ``shard_model``
+        # materialises directly with sharding); if that returns abstract
+        # ShapeDtypeStruct leaves (some EasyDeL versions only annotate),
+        # we fall back to direct construction. For ≤7B on a v6e-8 the
+        # direct path always works because each parameter tensor fits in
+        # 32 GB HBM per chip and ``shard_model`` then redistributes.
+        try:
+            model = ed.LlamaForCausalLM.lazy_init(
+                easy_cfg,
+                rngs=nnx.Rngs(cfg.seed),
+                dtype=getattr(jnp, cfg.compute_dtype),
+                param_dtype=getattr(jnp, cfg.param_dtype),
+                precision=None,
+            )
+            model = model.shard_model(mesh=mesh)
+            # Sanity check: if any leaf is still ShapeDtypeStruct (abstract),
+            # ``shard_model`` did not materialise — fall back to direct.
+            from jax import ShapeDtypeStruct  # type: ignore
+            leaves = jax.tree_util.tree_leaves(nnx.state(model, nnx.Param))
+            if any(isinstance(x, ShapeDtypeStruct) for x in leaves):
+                raise RuntimeError("shard_model returned abstract leaves")
+        except Exception as exc:
+            if jax.process_index() == 0:
+                print(f"[pretrain] lazy_init+shard_model failed ({exc}); "
+                      f"falling back to direct construction.", flush=True)
+            model = ed.LlamaForCausalLM(
+                easy_cfg,
+                rngs=nnx.Rngs(cfg.seed),
+                dtype=getattr(jnp, cfg.compute_dtype),
+                param_dtype=getattr(jnp, cfg.param_dtype),
+                precision=None,
+            )
+            try:
+                model = model.shard_model(mesh=mesh)
+            except Exception as e2:
+                if jax.process_index() == 0:
+                    print(f"[pretrain] post-init shard_model failed ({e2}); "
+                          f"continuing with replicated parameters.", flush=True)
         tx, lr_schedule = _build_optimizer(cfg, cfg.max_steps)
         optimizer = nnx.Optimizer(model, tx, wrt=nnx.Param)
 
@@ -526,8 +591,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", required=True)
     p.add_argument("--seq-len", type=int, default=8192)
     p.add_argument("--global-batch-tokens", type=int, default=2_097_152)
-    p.add_argument("--tp-size", type=int, default=4)
-    p.add_argument("--dp-size", type=int, default=None)
+    p.add_argument("--tp-size", type=int, default=1,
+                   help="Tensor-parallel axis size (mesh axis 'tp'). Default 1.")
+    p.add_argument("--dp-size", type=int, default=1,
+                   help="Pure data-parallel axis size (mesh axis 'dp'). Default 1.")
+    p.add_argument("--fsdp-size", type=int, default=-1,
+                   help="FSDP axis size (mesh axis 'fsdp'). -1 = consume all remaining chips. This is the axis EasyDeL's default partition rules shard parameters along.")
+    p.add_argument("--sp-size", type=int, default=1,
+                   help="Sequence-parallel axis size (mesh axis 'sp'). Default 1.")
     p.add_argument("--optimizer", default="adamw", choices=["adamw", "adafactor"])
     p.add_argument("--peak-lr", type=float, default=1.5e-4)
     p.add_argument("--warmup-steps", type=int, default=5_000)
@@ -569,6 +640,8 @@ def main(argv: list[str] | None = None) -> int:
         global_batch_tokens=args.global_batch_tokens,
         tp_size=args.tp_size,
         dp_size=args.dp_size,
+        fsdp_size=args.fsdp_size,
+        sp_size=args.sp_size,
         optimizer=args.optimizer,
         peak_lr=args.peak_lr,
         warmup_steps=args.warmup_steps,

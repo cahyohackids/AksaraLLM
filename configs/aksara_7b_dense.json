@@ -1,0 +1,63 @@
+{
+  "name": "aksarallm-7b-dense",
+  "family": "decoder-only-transformer",
+  "estimated_params": 7516459008,
+  "estimated_params_breakdown": {
+    "comment": "Computed for tied embeddings: per-layer attn (no bias, GQA 32:8, Q+O = 2*d*n_heads*head_dim = 33,554,432; K+V = 2*d*n_kv*head_dim = 8,388,608) = 41,943,040; per-layer SwiGLU FFN (3 * d * n_inner) = 176,160,768; per-layer norms (2 * d) = 8,192; per-layer total = 218,112,000. 32 layers = 6,979,584,000. Tied embedding (V * d) = 536,870,912. Final RMSNorm = 4,096. Grand total = 7,516,459,008 (~7.52 B). Sized to fit a single v6e-8 (32 GB HBM/chip) with adafactor + NOTHING_SAVEABLE checkpointing + scan_layers, leaving headroom for activations at seq_len=8192.",
+    "per_layer": 218112000,
+    "all_layers": 6979584000,
+    "embedding_tied": 536870912,
+    "final_norm": 4096
+  },
+  "architecture": {
+    "vocab_size": 131072,
+    "n_embd": 4096,
+    "n_inner": 14336,
+    "n_layers": 32,
+    "n_heads": 32,
+    "n_kv_heads": 8,
+    "head_dim": 128,
+    "norm_type": "rmsnorm",
+    "activation": "swiglu",
+    "positional_encoding": "rope",
+    "attention_type": "gqa",
+    "attention_bias": false,
+    "tie_embeddings": true,
+    "rope_theta": 1000000
+  },
+  "sequence_plan": {
+    "train_context_main": 8192,
+    "train_context_late": 8192,
+    "inference_context_target": 32768,
+    "rope_scaling": {
+      "type": "yarn",
+      "factor": 4.0,
+      "original_max_position_embeddings": 8192
+    }
+  },
+  "token_plan": {
+    "minimum_viable_tokens": 70000000000,
+    "recommended_tokens": 150000000000,
+    "strong_tokens": 300000000000,
+    "comment": "Available corpus is 84.64 B BPE tokens after dedup+tokenize. That is ~11.3x params, comfortably above the 'minimum viable' 2x and slightly below Llama-3-8B's ratio (~12x for the dataset Meta used)."
+  },
+  "training_plan_v6e8": {
+    "topology": "v6e-8",
+    "tp_size": 8,
+    "dp_size": 1,
+    "optimizer": "adafactor",
+    "param_dtype": "bfloat16",
+    "compute_dtype": "bfloat16",
+    "gradient_checkpointing": "NOTHING_SAVEABLE",
+    "scan_layers": true,
+    "global_batch_tokens": 65536,
+    "warmup_steps": 2000,
+    "max_steps": 1280000,
+    "comment": "1.28M steps * 65,536 tok/step = 84B tokens (~1 epoch over the dedup+tokenized corpus). At an estimated step time of 8-12s on v6e-8 this is roughly 4-6 months wall time. For a faster smoke / first-look run, set max_steps lower (e.g. 30,000 steps = 2B tokens, ~3-4 days)."
+  },
+  "notes": [
+    "7B is the largest dense LLaMA-style model that fits comfortably on a single v6e-8 with adafactor + grad checkpointing.",
+    "Use this config when v5p/v6e-32+ TPU is unavailable and you want a complete pretraining run that produces a usable model.",
+    "Same vocab and tokenizer as the 20B config (Ezekiel999/aksara-tokenizer-20b) so checkpoints can be evaluated with the same eval harness."
+  ]
+}
