@@ -67,6 +67,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -308,7 +309,7 @@ def _build_optimizer(cfg: PretrainConfig, num_steps: int):
         end_value=cfg.peak_lr * cfg.min_lr_ratio,
     )
     if cfg.optimizer == "adamw":
-        tx = optax.chain(
+        inner = optax.chain(
             optax.clip_by_global_norm(cfg.grad_clip),
             optax.adamw(
                 learning_rate=lr_schedule,
@@ -319,7 +320,7 @@ def _build_optimizer(cfg: PretrainConfig, num_steps: int):
             ),
         )
     elif cfg.optimizer == "adafactor":
-        tx = optax.chain(
+        inner = optax.chain(
             optax.clip_by_global_norm(cfg.grad_clip),
             optax.adafactor(
                 learning_rate=lr_schedule,
@@ -328,6 +329,13 @@ def _build_optimizer(cfg: PretrainConfig, num_steps: int):
         )
     else:
         raise ValueError(f"Unknown optimizer: {cfg.optimizer}")
+
+    # Skip optimizer updates whenever any gradient leaf is NaN/Inf so a
+    # single bad batch (or a numerical hiccup at peak LR) cannot poison the
+    # parameters for the rest of training. ``apply_if_finite`` keeps a
+    # counter of skipped steps; we tolerate up to 100 consecutive bad steps
+    # before propagating the failure to the host (which would fail the run).
+    tx = optax.apply_if_finite(inner, max_consecutive_errors=100)
     return tx, lr_schedule
 
 
@@ -619,7 +627,19 @@ def train(cfg: PretrainConfig) -> None:
                     )
 
             if step > 0 and step % cfg.ckpt_every == 0 and not cfg.smoke_test:
-                _save_checkpoint(ckpt_mgr, step, nnx.state(optimizer))
+                # Guard against persisting NaN/Inf state to GCS — saving a
+                # corrupted checkpoint would (a) waste GCS bandwidth, (b) get
+                # rotated into ``max_to_keep`` and evict the last clean
+                # checkpoint, leaving us with nothing to resume from.
+                _loss_f = float(loss)
+                if not (math.isfinite(_loss_f)):
+                    if jax.process_index() == 0:
+                        print(
+                            f"[pretrain] WARN: loss is non-finite ({_loss_f}) at step {step}; skipping checkpoint save.",
+                            flush=True,
+                        )
+                else:
+                    _save_checkpoint(ckpt_mgr, step, nnx.state(optimizer))
 
             if cfg.smoke_test and step >= 20:
                 if jax.process_index() == 0:
