@@ -263,11 +263,21 @@ def _save_checkpoint(ckpt_mgr, step: int, state) -> None:
 
     # Materialise sharded jax.Arrays → numpy before save. ``jax.device_get``
     # gathers across all hosts/chips so the resulting tree is fully replicated
-    # and contains no PartitionSpec references.
-    host_state = jax.tree_util.tree_map(
-        lambda x: np.asarray(jax.device_get(x)) if hasattr(x, "shape") else x,
-        state,
-    )
+    # and contains no PartitionSpec references. PRNGKey leaves cannot go
+    # through ``np.asarray`` directly — we extract their backing integer
+    # array via ``jax.random.key_data`` first.
+    def _to_host(x):
+        if not hasattr(x, "shape"):
+            return x
+        try:
+            from jax import dtypes as _jdtypes
+            if _jdtypes.issubdtype(x.dtype, _jdtypes.prng_key):
+                x = jax.random.key_data(x)
+        except Exception:
+            pass
+        return np.asarray(jax.device_get(x))
+
+    host_state = jax.tree_util.tree_map(_to_host, state)
 
     last_exc: Exception | None = None
     for try_fn in (
