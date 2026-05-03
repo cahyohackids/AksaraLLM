@@ -1,0 +1,68 @@
+{
+  "name": "aksarallm-2b-dense",
+  "family": "decoder-only-transformer",
+  "estimated_params": 2214725632,
+  "estimated_params_breakdown": {
+    "comment": "Tied embeddings; per-layer attn (Q+O = 2*d*n_heads*head_dim = 8,388,608; K+V = 2*d*n_kv*head_dim = 2,097,152) = 10,485,760; per-layer SwiGLU (3 * d * n_inner = 50,331,648); per-layer norms (2 * d = 4,096); per-layer total = 60,821,504. 32 layers = 1,946,288,128. Tied embedding (V * d = 268,435,456). Final RMSNorm = 2,048. Grand total = 2,214,725,632 (~2.21B). Sized to fit a single v6e-8 (32 GB HBM/chip) using fp32 master weights + bf16 compute even when EasyDeL's parameter shardings do not propagate to the optimiser state — fp32 params (8.86 GB) + factored Adafactor state (~6 GB) + transient gradients (8.86 GB) sums to ~24 GB per chip, with ~7 GB headroom for activations + program scratch.",
+    "per_layer": 60821504,
+    "all_layers": 1946288128,
+    "embedding_tied": 268435456,
+    "final_norm": 2048
+  },
+  "architecture": {
+    "vocab_size": 131072,
+    "n_embd": 2048,
+    "n_inner": 8192,
+    "n_layers": 32,
+    "n_heads": 16,
+    "n_kv_heads": 4,
+    "head_dim": 128,
+    "norm_type": "rmsnorm",
+    "activation": "swiglu",
+    "positional_encoding": "rope",
+    "attention_type": "gqa",
+    "attention_bias": false,
+    "tie_embeddings": true,
+    "rope_theta": 1000000
+  },
+  "sequence_plan": {
+    "train_context_main": 8192,
+    "train_context_late": 8192,
+    "inference_context_target": 32768,
+    "rope_scaling": {
+      "type": "yarn",
+      "factor": 4.0,
+      "original_max_position_embeddings": 8192
+    }
+  },
+  "token_plan": {
+    "minimum_viable_tokens": 20000000000,
+    "recommended_tokens": 84640000000,
+    "strong_tokens": 200000000000,
+    "comment": "Available corpus is 84.64 B BPE tokens after dedup+tokenize. That is ~38x params, well above 'minimum viable' (2x) and a healthy ratio for a first-cut Indonesian LLM."
+  },
+  "training_plan_v6e8": {
+    "topology": "v6e-8",
+    "fsdp_size": 8,
+    "tp_size": 1,
+    "dp_size": 1,
+    "sp_size": 1,
+    "optimizer": "adamw",
+    "param_dtype": "float32",
+    "compute_dtype": "bfloat16",
+    "gradient_checkpointing": "NOTHING_SAVEABLE",
+    "scan_layers": true,
+    "global_batch_tokens": 65536,
+    "warmup_steps": 2000,
+    "peak_lr": 1.5e-4,
+    "grad_clip": 1.0,
+    "max_steps": 1290000,
+    "comment": "AdamW chosen after smoke testing showed Adafactor + tied embeddings collapses the model to uniform softmax (loss=ln(V)=11.78) within ~30 steps regardless of LR. AdamW at peak_lr=5e-5 / 1.5e-4 keeps loss decreasing monotonically (12.18 -> 6.87 in 200 smoke steps). 1.29M steps * 65,536 tok/step = 84.5 B tokens (~1 epoch over the dedup+tokenized corpus). Picked deliberately as the LARGEST model that runs end-to-end on v6e-8 with the current EasyDeL trainer (where nnx.Optimizer does not propagate parameter shardings to the optimiser state) AND fp32 master weights to avoid bf16 underflow in the optimiser update path. For shorter wall time, set max_steps=200_000 (~13 B tokens, multiple weeks)."
+  },
+  "notes": [
+    "AksaraLLM-2B is the production-grade target for v6e-8 with the current trainer.",
+    "Topology mirrors Llama-2-7B/Llama-3-8B style (RMSNorm + SwiGLU + RoPE + GQA).",
+    "Tokenizer: Ezekiel999/aksara-tokenizer-20b (vocab=131072), identical to the 4B/7B/20B configs.",
+    "If you ever get access to v6e-32+ or v5p-64, switch to ``aksara_4b_dense.json`` / ``aksara_7b_dense.json``."
+  ]
+}
