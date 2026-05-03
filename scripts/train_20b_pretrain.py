@@ -510,7 +510,7 @@ def train(cfg: PretrainConfig) -> None:
             max_to_keep=cfg.ckpt_keep,
             keep_period=cfg.ckpt_permanent_every,
             create=True,
-            enable_async_checkpointing=True,
+            enable_async_checkpointing=False,
         ),
     )
     start_step = 0
