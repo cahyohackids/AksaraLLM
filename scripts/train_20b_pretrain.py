@@ -248,14 +248,32 @@ def _save_checkpoint(ckpt_mgr, step: int, state) -> None:
     Orbax changed StandardSave wrapping twice between 0.5 and 0.11 — older
     managers accept ``args=StandardSave(state)`` directly, newer ones require
     wrapping in ``Composite(state=StandardSave(state))``. Try them in order.
+
+    NOTE: Orbax's internal serialization of param shardings re-checks the
+    PartitionSpec against an internal mesh; if the EasyDeL params reference
+    mesh axes (``dp``, ``fsdp``, ``tp``, ``sp``) but Orbax sees only
+    ``('data',)`` the save fails with ``Resource axis: fsdp not found``.
+    To dodge this, we host-materialise the state to plain numpy via
+    ``jax.device_get`` before handing it to Orbax — this also avoids the
+    async/sync deadlock observed with v0.11.36 since the data is no longer
+    distributed.
     """
     import orbax.checkpoint as ocp  # type: ignore
+    import numpy as np
+
+    # Materialise sharded jax.Arrays → numpy before save. ``jax.device_get``
+    # gathers across all hosts/chips so the resulting tree is fully replicated
+    # and contains no PartitionSpec references.
+    host_state = jax.tree_util.tree_map(
+        lambda x: np.asarray(jax.device_get(x)) if hasattr(x, "shape") else x,
+        state,
+    )
 
     last_exc: Exception | None = None
     for try_fn in (
-        lambda: ckpt_mgr.save(step, args=ocp.args.Composite(state=ocp.args.StandardSave(state))),
-        lambda: ckpt_mgr.save(step, args=ocp.args.StandardSave(state)),
-        lambda: ckpt_mgr.save(step, state),
+        lambda: ckpt_mgr.save(step, args=ocp.args.Composite(state=ocp.args.StandardSave(host_state))),
+        lambda: ckpt_mgr.save(step, args=ocp.args.StandardSave(host_state)),
+        lambda: ckpt_mgr.save(step, host_state),
     ):
         try:
             try_fn()
